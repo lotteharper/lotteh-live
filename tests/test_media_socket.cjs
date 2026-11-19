@@ -3,8 +3,8 @@ const fs = require('node:fs');
 const test = require('node:test');
 const vm = require('node:vm');
 
-function socketScript() {
-    const template = fs.readFileSync('golivevideo.html', 'utf8');
+function socketScript(templateName) {
+    const template = fs.readFileSync(templateName, 'utf8');
     const start = template.indexOf('var mediaSocket;');
     const end = template.indexOf("var form = document.getElementById('live-form');", start);
     return template.slice(start, end)
@@ -13,7 +13,41 @@ function socketScript() {
         .replace(/{{[^}]+}}/g, 'camera');
 }
 
-function setup() {
+test('screencast posts segments over HTTP and reports upload failures', async () => {
+    const template = fs.readFileSync('screencast.html', 'utf8');
+    let script = template.slice(template.indexOf('let uploadQueue = Promise.resolve();'),
+        template.indexOf('function stopRecordingFn()', template.indexOf('let uploadQueue = Promise.resolve();')));
+    script = script.replace("{% if should_compress_live %}'zip'{% else %}extension{% endif %}", 'extension')
+        .replace(/{% if should_compress_live %}[\s\S]*?{% endif %}/g, '')
+        .replace(/{% if use_websocket %}[\s\S]*?{% else %}/, '')
+        .replace(/{% endif %}/g, '');
+    const messages = [];
+    let stopped = false;
+    const context = vm.createContext({
+        Blob, FormData, Date, console,
+        recordedChunks: [new Blob(['video'])], mimeType: 'video/webm', CAMERA_ID: 'stream1',
+        crypto: {randomUUID: () => 'segment1'}, form: {action: '/screencast/?camera=private'},
+        fetch: async (url, options) => {
+            assert.equal(url, '/screencast/?camera=private');
+            assert.equal(options.body.get('viduid'), 'stream1');
+            assert.equal(options.body.get('confirmation_id'), 'segment1');
+            assert.equal(await options.body.get('frame').text(), 'video');
+            return {ok: false, status: 500};
+        },
+        document: {getElementById: () => ({
+            set textContent(value) { messages.push(value); },
+            classList: {add() {}, remove() {}},
+        })},
+        stopRecordingFn: () => { stopped = true; },
+    });
+    vm.runInContext(script, context);
+    context.download();
+    await vm.runInContext('uploadQueue', context);
+    assert.equal(stopped, true);
+    assert.match(messages[0], /Video upload failed: 500/);
+});
+
+function setup(templateName) {
     const sockets = [];
     class Socket {
         static CONNECTING = 0;
@@ -40,12 +74,13 @@ function setup() {
         WebSocket: Socket, window: {location: {protocol: 'https:', host: 'example.test'}},
         console: {log() {}, error() {}}, setTimeout, clearTimeout, Date,
     });
-    vm.runInContext(socketScript(), context);
+    vm.runInContext(socketScript(templateName), context);
     return {context, sockets};
 }
 
-test('waits for a reconnect before sending a segment', async () => {
-    const {context, sockets} = setup();
+for (const templateName of ['golivevideo.html', 'screencast.html']) {
+test(`${templateName}: waits for a reconnect before sending a segment`, async () => {
+    const {context, sockets} = setup(templateName);
     sockets[0].close(1006);
     const pending = context.waitForMediaSocket();
     await new Promise(resolve => setTimeout(resolve, 30));
@@ -54,18 +89,19 @@ test('waits for a reconnect before sending a segment', async () => {
     assert.equal(await pending, sockets[1]);
 });
 
-test('does not reconnect after an authorization rejection', async () => {
-    const {context, sockets} = setup();
+test(`${templateName}: does not reconnect after an authorization rejection`, async () => {
+    const {context, sockets} = setup(templateName);
     sockets[0].close(4403);
     await assert.rejects(context.waitForMediaSocket(), /not authorized/);
     await new Promise(resolve => setTimeout(resolve, 30));
     assert.equal(sockets.length, 1);
 });
 
-test('uploads large video in separate bounded binary messages', async () => {
-    const template = fs.readFileSync('golivevideo.html', 'utf8');
+test(`${templateName}: uploads large video in separate bounded binary messages`, async () => {
+    const template = fs.readFileSync(templateName, 'utf8');
+    const end = templateName === 'screencast.html' ? 'function stopRecordingFn()' : "{% include 'live/remote.js' %}";
     let script = template.slice(template.indexOf('let uploadQueue = Promise.resolve();'),
-        template.indexOf("{% include 'live/remote.js' %}"));
+        template.indexOf(end, template.indexOf('let uploadQueue = Promise.resolve();')));
     script = script.replace(/{% if should_compress_live %}[\s\S]*?{% endif %}/g, '')
         .replace(/{% if use_websocket %}/, '')
         .replace(/{% else %}[\s\S]*?{% endif %}/, '');
@@ -102,3 +138,4 @@ test('uploads large video in separate bounded binary messages', async () => {
     assert.equal(chunks.reduce((sum, chunk) => sum + chunk.size, 0), 2 * 1024 * 1024 + 17);
     assert.equal(JSON.parse(messages.at(-1)).type, 'segment_end');
 });
+}
