@@ -212,6 +212,7 @@ var live = false;
 var recording = false;
 var mediaSocket;
 var mediaSocketReconnectTimeout;
+var mediaSocketRejected = false;
 function openMediaSocket() {
     {% if use_websocket %}
     if(mediaSocketReconnectTimeout) {
@@ -221,10 +222,15 @@ function openMediaSocket() {
     if(mediaSocket && (mediaSocket.readyState == WebSocket.OPEN || mediaSocket.readyState == WebSocket.CONNECTING)) return;
     mediaSocket = new WebSocket((window.location.protocol == 'https:' ? "wss://" : "ws://") + window.location.host + '/ws/live/camera/' + encodeURIComponent('{{ camera.user.profile.name|escapejs }}') + '/' + encodeURIComponent('{{ camera.name|escapejs }}') + '/?key=' + encodeURIComponent('{{ key|escapejs }}'));
     mediaSocket.addEventListener("open", (event) => {
+        mediaSocketRejected = false;
         console.log('Media socket open.');
     });
     mediaSocket.addEventListener("close", (event) => {
-        console.log('Socket closed.');
+        console.error('Media socket closed:', event.code, event.reason);
+        if (event.code === 4403) {
+            mediaSocketRejected = true;
+            return;
+        }
         if(mediaSocketReconnectTimeout) clearTimeout(mediaSocketReconnectTimeout);
         mediaSocketReconnectTimeout = setTimeout(function() {
             openMediaSocket();
@@ -236,6 +242,16 @@ function openMediaSocket() {
     {% endif %}
 }
 openMediaSocket();
+async function waitForMediaSocket() {
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+        if (mediaSocketRejected) throw new Error('Video connection was not authorized');
+        if (mediaSocket && mediaSocket.readyState === WebSocket.OPEN) return mediaSocket;
+        if ((!mediaSocket || mediaSocket.readyState === WebSocket.CLOSED) && !mediaSocketReconnectTimeout) openMediaSocket();
+        await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    throw new Error('Video connection did not reconnect');
+}
 var form = document.getElementById('live-form');
 var data;
 var mediaChunks = [];
@@ -651,7 +667,7 @@ function handleDataAvailable(event) {
 var remoteSocketReconnectTimeout;
 var cameraon = false;
 function openRemoteSocket() {
-        var remoteSocket = new WebSocket((window.location.protocol == 'https:' ? "wss://" : "ws://") + window.location.hostname + '/ws/live/remote/{{ camera.user.profile.name }}/{{ camera.name }}/');
+        var remoteSocket = new WebSocket((window.location.protocol == 'https:' ? "wss://" : "ws://") + window.location.host + '/ws/live/remote/' + encodeURIComponent('{{ camera.user.profile.name|escapejs }}') + '/' + encodeURIComponent('{{ camera.name|escapejs }}') + '/');
         remoteSocket.addEventListener("open", (event) => {
             console.log('Remote socket open.');
         });
@@ -664,10 +680,6 @@ function openRemoteSocket() {
         });
         remoteSocket.addEventListener("error", (event) => {
             console.log('Remote socket error.');
-            if(remoteSocketReconnectTimeout) clearTimeout(remoteSocketReconnectTimeout);
-            remoteSocketReconnectTimeout = setTimeout(function() {
-                openRemoteSocket();
-            }, {{ reload_time|default:10000 }});
         });
         remoteSocket.addEventListener("message", (event) => {
             var instructions = event.data.split(',');
@@ -719,38 +731,66 @@ function download() {
         formdata.append('viduid', videoId);
         formdata.append('confirmation_id', confirmationId);
         {% if use_websocket %}
-        const dataUrl = await new Promise((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onload = () => resolve(reader.result);
-            reader.onerror = () => reject(reader.error);
-            reader.readAsDataURL(file);
-        });
-        formdata.append('frame', dataUrl);
-        if (!mediaSocket || mediaSocket.readyState !== WebSocket.OPEN) {
-            throw new Error('Video connection is not open');
-        }
+        const socket = await waitForMediaSocket();
         await new Promise((resolve, reject) => {
-            const socket = mediaSocket;
-            const timeout = setTimeout(() => finish(new Error('Video upload timed out')), 30000);
+            let timeout;
+            let finished = false;
+            let sending = false;
+            function resetTimeout() {
+                clearTimeout(timeout);
+                timeout = setTimeout(() => finish(new Error('Video upload timed out')), 30000);
+            }
             function finish(error) {
+                if (finished) return;
+                finished = true;
                 clearTimeout(timeout);
                 socket.removeEventListener('message', onMessage);
                 socket.removeEventListener('close', onClose);
                 if (error) reject(error); else resolve();
             }
-            function onClose() { finish(new Error('Video connection closed during upload')); }
+            function onClose(event) {
+                finish(new Error('Video connection closed during upload (code ' + event.code +
+                    (event.reason ? ': ' + event.reason : '') + ')'));
+            }
+            async function sendChunks() {
+                try {
+                    for (let offset = 0; offset < file.size; offset += 65536) {
+                        while (!finished && socket.bufferedAmount > 1024 * 1024) {
+                            await new Promise(resolve => setTimeout(resolve, 20));
+                        }
+                        if (finished) return;
+                        socket.send(file.slice(offset, offset + 65536));
+                        resetTimeout();
+                    }
+                    socket.send(JSON.stringify({type: 'segment_end'}));
+                    resetTimeout();
+                } catch (error) {
+                    finish(error);
+                }
+            }
             function onMessage(event) {
                 try {
                     const response = JSON.parse(event.data);
                     if (response.error) finish(new Error(response.error));
+                    else if (response.ready === confirmationId && !sending) {
+                        sending = true;
+                        sendChunks();
+                    }
                     else if (response.confirmation_id === confirmationId) finish();
                 } catch (error) { finish(error); }
             }
             socket.addEventListener('message', onMessage);
             socket.addEventListener('close', onClose);
-            try { socket.send(new URLSearchParams(formdata).toString()); }
+            resetTimeout();
+            try {
+                socket.send(JSON.stringify({
+                    type: 'segment_start', timestamp: timestamp, viduid: videoId,
+                    confirmation_id: confirmationId, size: file.size
+                }));
+            }
             catch (error) { finish(error); }
         });
+        document.getElementById('upload-error').classList.add('hide');
         {% else %}
         formdata.append('frame', file, 'frame.' + {% if should_compress_live %}'zip'{% else %}extension{% endif %});
         const response = await fetch(form.action, {method: 'POST', body: formdata});
@@ -759,7 +799,7 @@ function download() {
     }).catch(error => {
         console.error('Video segment upload failed', error);
         const message = document.getElementById('upload-error');
-        message.textContent = 'A video segment could not be uploaded. Check your connection and restart the recording.';
+        message.textContent = 'A video segment could not be uploaded: ' + error.message + '. Check your connection and restart the recording.';
         message.classList.remove('hide');
         stopRecordingFn();
     });
