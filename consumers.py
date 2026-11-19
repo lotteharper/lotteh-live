@@ -132,75 +132,37 @@ def get_camera_status(camera_user, camera_name):
 
 @sync_to_async
 def update_camera(self, user_id, camera_user, camera_name, camera_data, key=None):
-    embed_logo = False
     from live.models import VideoCamera
-    from live.models import get_file_path, VideoFrame, VideoRecording, Show
-    import pytz, datetime, os, base64, asyncio, time
-    from django.utils import timezone
-    from django.conf import settings
-    import urllib.parse
+    from live.video_upload import save_video_segment
+    import base64
+    import binascii
     from urllib.parse import parse_qs
-    from live.still import is_still
-    from lotteh.celery import process_live, process_recording, delay_remove_frame
     from django.core.exceptions import PermissionDenied
-    camera = None
-    if key:
-        camera = VideoCamera.objects.filter(user__profile__name=camera_user, name=camera_name, key=key).order_by('-last_frame').first()
-        if camera and camera.user.profile.vendor != True: raise PermissionDenied()
-    if user_id and not camera:
-        camera = VideoCamera.objects.filter(user__id=int(user_id), name=camera_name).order_by('-last_frame').first()
-        if camera and camera.user.profile.vendor != True: raise PermissionDenied()
-    if not camera: raise PermissionDenied()
-    camera.last_frame = timezone.now()
-    camera_data = camera_data.split("&")
-    timestamp = urllib.parse.unquote(camera_data[4].split('=', 1)[1])
-    timestamp = datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-    videouid = urllib.parse.unquote(camera_data[5].split('=', 1)[1])
-    frame_data = urllib.parse.unquote(camera_data[6].split('=', 1)[1]).split(',')[1]
-    if camera.recording:
-        # Find the most recent active recording for this camera/user
-        recording = VideoRecording.objects.filter(
-            user=camera.user,
-            camera=camera.name,
-            camera_id=videouid,
-            processing=False
-        ).order_by('-last_frame').first()
-        # Decide if you need to start a new recording
-        should_start_new = (
-            not recording or
-            ((recording.frames.count() * (settings.LIVE_INTERVAL/1000.0)) > (camera.video_length_minutes * 60.0))
-        )
-
-        is_a_short = (camera.short_mode and (recording.frames.count() * (settings.LIVE_INTERVAL/1000.0) > settings.LIVE_SHORT_SECONDS))
-
-        if should_start_new or is_a_short:
-            recording = VideoRecording.objects.create(
-                user=camera.user,
-                camera=camera.name,
-                last_frame=timestamp,
-                camera_id=videouid
-            )
-            camera.last_frame = timestamp
-            camera.save()
-
-    path = os.path.join(settings.MEDIA_ROOT, get_file_path(camera, 'frame.' + camera.mimetype.split(';')[0]))
-    with open(path, "wb") as file:
-        bytes_data = base64.b64decode(frame_data)
-        file.write(bytes_data)
-    file.close()
-    is_frame_still, error = is_still(path)
-    frame = VideoFrame.objects.create(user=camera.user, time_captured=timestamp, compressed=camera.user.vendor_profile.compress_video, confirmation_id=camera_data[3].split('=', 1)[1], frame=path, difference=error, adjust_pitch=camera.adjust_pitch, animate_video=camera.animate_video)
-    if camera.recording:
-        recording.frames.add(frame)
-        recording.last_frame = timestamp
-        recording.save()
-    process_recording.apply_async([recording.id], countdown=(settings.LIVE_INTERVAL/1000) * 12)
-    process_live.apply_async([camera.id, frame.id], countdown=settings.LIVE_INTERVAL)
+    camera = VideoCamera.objects.filter(
+        user__id=user_id, user__profile__name=camera_user, name=camera_name, key=key
+    ).order_by('-last_frame').first()
+    if not camera or not camera.user.profile.vendor:
+        raise PermissionDenied()
+    try:
+        params = parse_qs(camera_data, strict_parsing=True)
+        values = {name: params[name][0] for name in ('timestamp', 'viduid', 'confirmation_id', 'frame')
+                  if len(params[name]) == 1}
+        header, encoded = values['frame'].split(',', 1)
+        if not header.startswith('data:') or not header.endswith(';base64'):
+            raise ValueError("Invalid video data URL")
+        content = base64.b64decode(encoded, validate=True)
+        frame = save_video_segment(camera, values['timestamp'], values['viduid'], values['confirmation_id'], content)
+    except (KeyError, ValueError, binascii.Error) as exc:
+        raise ValueError("Invalid video segment") from exc
     if camera.broadcast_youtube:
         if (not self.stream_url) or (not self.stream_key):
             from recordings.youtube import create_youtube_stream
             self.stream_url, self.stream_key = create_youtube_stream(camera.title, camera.description, camera.privacy_status, camera.user, email=camera.upload_email)
-        stream_mp4_to_youtube(path, self.stream_url, self.stream_key)
+        threading.Thread(
+            target=stream_mp4_to_youtube,
+            args=(frame.frame.path, self.stream_url, self.stream_key),
+            daemon=True,
+        ).start()
     return frame.confirmation_id
 
 @sync_to_async
@@ -354,9 +316,10 @@ class CameraConsumer(AsyncWebsocketConsumer):
         query_params = parse_qs(self.scope["query_string"].decode())
         if 'key' in query_params and query_params['key']: self.key = query_params['key'][0]
         self.user_id = self.scope['user'].id
-        authorized = await get_auth(self.scope['user'].id, self.scope['session'].session_key)
-        if not authorized:
+        authorized = bool(self.user_id) and await get_auth(self.user_id, self.scope['session'].session_key)
+        if not authorized or not self.key:
             print('Camera not authorized')
+            await self.close(code=4403)
             return
 #        broadcast, upload = await get_camera_upload(self)
 #        if broadcast and not upload: await initiate_stream(self)
@@ -365,11 +328,24 @@ class CameraConsumer(AsyncWebsocketConsumer):
     async def disconnect(self, close_code):
         pass
 
-    async def receive(self, text_data):
-        text = await update_camera(self, self.user_id, self.camera_user, self.camera_name, text_data, self.key)
+    async def receive(self, text_data=None, bytes_data=None):
+        from django.core.exceptions import PermissionDenied
+        import logging
         try:
-            await self.send(text_data=text)
-        except: pass
+            if text_data is None:
+                raise ValueError("Expected a text video segment")
+            text = await update_camera(self, self.user_id, self.camera_user, self.camera_name, text_data, self.key)
+        except PermissionDenied:
+            await self.close(code=4403)
+            return
+        except (ValueError, TypeError):
+            await self.send(text_data=json.dumps({'error': 'Invalid video segment'}))
+            return
+        except Exception:
+            logging.getLogger(__name__).exception("Failed to save video segment")
+            await self.send(text_data=json.dumps({'error': 'Video segment upload failed'}))
+            return
+        await self.send(text_data=json.dumps({'confirmation_id': text}))
 
     pass
 
