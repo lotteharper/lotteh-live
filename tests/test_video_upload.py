@@ -2,6 +2,7 @@ import io
 import sys
 import types
 import zipfile
+from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 
 from django.test import SimpleTestCase, override_settings
@@ -25,17 +26,24 @@ class VideoSegmentTests(SimpleTestCase):
         self.frame.frame.path = '/tmp/segment.webm'
         self.frame_model = MagicMock(return_value=self.frame)
         self.recording_model = MagicMock()
+        self.camera_model = MagicMock()
         self.is_still = MagicMock(return_value=(False, 0.25))
         self.process_live = MagicMock()
         self.process_recording = MagicMock()
         modules = {
-            'live.models': types.SimpleNamespace(VideoFrame=self.frame_model, VideoRecording=self.recording_model),
+            'live.models': types.SimpleNamespace(VideoFrame=self.frame_model, VideoRecording=self.recording_model, VideoCamera=self.camera_model),
             'live.still': types.SimpleNamespace(is_still=self.is_still),
             'lotteh.celery': types.SimpleNamespace(process_live=self.process_live, process_recording=self.process_recording),
         }
         self.modules = patch.dict(sys.modules, modules)
         self.modules.start()
         self.addCleanup(self.modules.stop)
+        atomic = patch('live.video_upload.transaction.atomic', return_value=nullcontext())
+        on_commit = patch('live.video_upload.transaction.on_commit', side_effect=lambda callback: callback())
+        atomic.start()
+        on_commit.start()
+        self.addCleanup(atomic.stop)
+        self.addCleanup(on_commit.stop)
 
     def save(self, data=b'video'):
         return save_video_segment(self.camera, '2026-01-01T00:00:00Z', 'stream1', 'segment1', data)
@@ -45,13 +53,13 @@ class VideoSegmentTests(SimpleTestCase):
         self.frame.frame.save.assert_called_once()
         self.process_live.delay.assert_called_once_with(1, 2)
         self.process_recording.apply_async.assert_not_called()
-        self.recording_model.objects.filter.assert_not_called()
+        self.recording_model.objects.select_for_update.assert_not_called()
 
     def test_recording_rolls_over_at_configured_boundary(self):
         self.camera.recording = True
         previous = MagicMock()
         previous.frames.count.return_value = 3
-        self.recording_model.objects.filter.return_value.order_by.return_value.first.return_value = previous
+        self.recording_model.objects.select_for_update.return_value.filter.return_value.order_by.return_value.first.return_value = previous
         new = self.recording_model.objects.create.return_value
         self.save()
         new.frames.add.assert_called_once_with(self.frame)
@@ -62,7 +70,7 @@ class VideoSegmentTests(SimpleTestCase):
         self.camera.recording = True
         previous = MagicMock()
         previous.frames.count.return_value = 2
-        self.recording_model.objects.filter.return_value.order_by.return_value.first.return_value = previous
+        self.recording_model.objects.select_for_update.return_value.filter.return_value.order_by.return_value.first.return_value = previous
         self.save()
         previous.frames.add.assert_called_once_with(self.frame)
         self.recording_model.objects.create.assert_not_called()
@@ -72,9 +80,22 @@ class VideoSegmentTests(SimpleTestCase):
         self.camera.short_mode = True
         previous = MagicMock()
         previous.frames.count.return_value = 2
-        self.recording_model.objects.filter.return_value.order_by.return_value.first.return_value = previous
+        self.recording_model.objects.select_for_update.return_value.filter.return_value.order_by.return_value.first.return_value = previous
         self.save()
         self.recording_model.objects.create.return_value.frames.add.assert_called_once_with(self.frame)
+
+    def test_recording_uses_server_upload_time_and_excludes_finished_recordings(self):
+        self.camera.recording = True
+        previous = MagicMock()
+        previous.frames.count.return_value = 1
+        self.recording_model.objects.select_for_update.return_value.filter.return_value.order_by.return_value.first.return_value = previous
+        with patch('live.video_upload.timezone.now') as now:
+            self.save()
+        self.assertEqual(previous.last_frame, now.return_value)
+        self.recording_model.objects.select_for_update.return_value.filter.assert_called_once_with(
+            user=self.camera.user, camera=self.camera.name, camera_id='stream1',
+            processing=False, processed=False,
+        )
 
     def test_compressed_segment_is_inspected_as_video(self):
         self.camera.compress_video = True
