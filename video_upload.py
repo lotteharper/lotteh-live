@@ -5,12 +5,13 @@ import zipfile
 
 from django.conf import settings
 from django.core.files.base import ContentFile
+from django.db import transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
 
 def save_video_segment(camera, timestamp, video_id, confirmation_id, content):
-    from live.models import VideoFrame, VideoRecording
+    from live.models import VideoCamera, VideoFrame, VideoRecording
     from live.still import is_still
     from lotteh.celery import process_live, process_recording
 
@@ -50,21 +51,26 @@ def save_video_segment(camera, timestamp, video_id, confirmation_id, content):
     camera.confirmation_id = confirmation_id
     camera.save(update_fields=['last_frame', 'confirmation_id'])
 
-    if camera.recording:
-        recording = VideoRecording.objects.filter(
-            user=camera.user, camera=camera.name, camera_id=video_id, processing=False
-        ).order_by('-last_frame').first()
-        limit = camera.video_length_minutes * 60
-        if camera.short_mode:
-            limit = min(limit, settings.LIVE_SHORT_SECONDS)
-        if not recording or recording.frames.count() * settings.LIVE_INTERVAL / 1000 >= limit:
-            recording = VideoRecording.objects.create(
-                user=camera.user, camera=camera.name, last_frame=captured, camera_id=video_id
-            )
-        recording.frames.add(frame)
-        recording.last_frame = captured
-        recording.save()
-        process_recording.apply_async([recording.id], countdown=settings.LIVE_INTERVAL / 1000 * 12)
+    with transaction.atomic():
+        if camera.recording:
+            VideoCamera.objects.select_for_update().get(id=camera.id)
+            recording = VideoRecording.objects.select_for_update().filter(
+                user=camera.user, camera=camera.name, camera_id=video_id,
+                processing=False, processed=False,
+            ).order_by('-last_frame').first()
+            limit = camera.video_length_minutes * 60
+            if camera.short_mode:
+                limit = min(limit, settings.LIVE_SHORT_SECONDS)
+            if not recording or recording.frames.count() * settings.LIVE_INTERVAL / 1000 >= limit:
+                recording = VideoRecording.objects.create(
+                    user=camera.user, camera=camera.name, last_frame=timezone.now(), camera_id=video_id
+                )
+            recording.frames.add(frame)
+            recording.last_frame = timezone.now()
+            recording.save()
+            transaction.on_commit(lambda: process_recording.apply_async(
+                [recording.id], countdown=settings.LIVE_INTERVAL / 1000 * 12
+            ))
 
-    process_live.delay(camera.id, frame.id)
+        transaction.on_commit(lambda: process_live.delay(camera.id, frame.id))
     return frame
